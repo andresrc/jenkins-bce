@@ -23,7 +23,13 @@
  */
 package org.jenkinsci.tools.bce;
 
+import com.google.common.base.Function;
+import com.google.common.base.Predicate;
+import com.google.common.base.Predicates;
 import com.google.common.base.Splitter;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonParser;
@@ -40,9 +46,10 @@ import org.apache.maven.artifact.Artifact;
 import org.apache.maven.artifact.DefaultArtifact;
 import org.apache.maven.artifact.handler.DefaultArtifactHandler;
 import org.apache.maven.artifact.repository.ArtifactRepository;
-import org.apache.maven.artifact.resolver.ArtifactNotFoundException;
-import org.apache.maven.artifact.resolver.ArtifactResolutionException;
+import org.apache.maven.artifact.resolver.ArtifactResolutionRequest;
+import org.apache.maven.artifact.resolver.ArtifactResolutionResult;
 import org.apache.maven.artifact.resolver.ArtifactResolver;
+import org.apache.maven.artifact.resolver.filter.ArtifactFilter;
 import org.apache.maven.artifact.versioning.VersionRange;
 import org.apache.maven.plugin.AbstractMojo;
 import org.apache.maven.plugin.MojoExecutionException;
@@ -52,9 +59,11 @@ import org.apache.maven.plugins.annotations.Mojo;
 import org.apache.maven.plugins.annotations.Parameter;
 import org.apache.maven.project.MavenProject;
 
+import javax.annotation.Nullable;
 import java.io.File;
 import java.io.StringReader;
 import java.util.List;
+import java.util.Set;
 
 import static japicmp.cli.JApiCli.ClassPathMode.TWO_SEPARATE_CLASSPATHS;
 
@@ -66,10 +75,21 @@ import static japicmp.cli.JApiCli.ClassPathMode.TWO_SEPARATE_CLASSPATHS;
 @Mojo(name = "check")
 public class JenkinsBCEMojo extends AbstractMojo {
     /**
-     * Default update center.
+     * Update center baseline specification.
      */
-    private static final String UPDATE_CENTER = "https://updates.jenkins-ci.org/update-center.json";
-
+    private static final String UPDATE_CENTER = "update:";
+    /**
+     * Artifact version baseline specification.
+     */
+    private static final String VERSION = "version:";
+    /**
+     * Artifact baseline specification.
+     */
+    private static final String ARTIFACT = "artifact:";
+    /**
+     * Skip comparison baseline specification.
+     */
+    private static final String SKIP = "skip";
     /**
      * Current Maven Project.
      */
@@ -93,6 +113,16 @@ public class JenkinsBCEMojo extends AbstractMojo {
      */
     @Parameter(defaultValue = "${project.remoteArtifactRepositories}")
     private List<ArtifactRepository> artifactRepositories;
+    /**
+     * Baseline acquisition method. It can be:
+     * <ul>
+     * <li>{@code update:<i>url</i>}: use update center.</li>
+     * <li>{@code version:<i>version</i>}: use the same artifact of the current project, with another version.</li>
+     * <li>{@code artifact:<i>groupId</i>:<i>artifact</i>:<i>version</i>}: use the specified jar artifact.
+     * </ul>
+     */
+    @Parameter(defaultValue = "update:https://updates.jenkins-ci.org/update-center.json")
+    private String baseline;
 
     private void error(CharSequence s) {
         getLog().error(s);
@@ -118,28 +148,35 @@ public class JenkinsBCEMojo extends AbstractMojo {
         info(String.format(s, args));
     }
 
+    private MojoFailureException failure(Throwable cause, String format, Object... args) {
+        String error = String.format(format, args);
+        error(error);
+        return new MojoFailureException(error, cause);
+    }
+
+    private MojoFailureException failure(String format, Object... args) {
+        String error = String.format(format, args);
+        error(error);
+        return new MojoFailureException(error);
+    }
+
     public void execute() throws MojoExecutionException, MojoFailureException {
-        if (mavenProject == null) {
-            warn("No project configured. Skipping");
+        if (skip()) {
+            warn("Skipping execution.");
+            return;
         }
         // Check we are in a plugin
         // We will check core later
         final String packaging = mavenProject.getPackaging();
         if (!"hpi".equals(packaging)) {
             warn("Not a Jenkins plugin. Skipping");
+            return;
         }
 
         // Get the new package file.
-        final File newVersion = new File(projectBuildDir, mavenProject.getArtifactId() + ".jar");
-        if (!newVersion.isFile() && !newVersion.canRead()) {
-            warnf("Unable to read generated file [%s]. Skipping.", newVersion);
-        }
+        final List<File> newVersion = ImmutableList.of(new File(projectBuildDir, mavenProject.getArtifactId() + ".jar"));
         // Get the old package file
-        final File oldVersion = getOldVersionFile();
-        if (!oldVersion.isFile() && !oldVersion.canRead()) {
-            warnf("Unable to read generated file [%s]. Skipping.", oldVersion);
-        }
-        infof("Comparing [%s] with baseline [%s] for binary compatibility enforcement", newVersion.getAbsolutePath(), oldVersion.getAbsolutePath());
+        final Iterable<File> oldVersion = getOldVersionFiles();
         final Options options = createOptions(oldVersion, newVersion);
         JarArchiveComparator jarArchiveComparator = new JarArchiveComparator(JarArchiveComparatorOptions.of(options));
         List<JApiClass> jApiClasses = jarArchiveComparator.compare(options.getOldArchives(), options.getNewArchives());
@@ -160,67 +197,204 @@ public class JenkinsBCEMojo extends AbstractMojo {
         }
     }
 
-    private File getOldVersionFile() throws MojoFailureException {
-        // TODO: Make resolution method configurable.
+    /**
+     * @return Whether we should skip execution.
+     */
+    private boolean skip() {
+        return mavenProject == null || baseline == null || baseline.startsWith(SKIP);
+    }
+
+    private Iterable<File> getOldVersionFiles() throws MojoFailureException {
+        ResolvedArtifact resolved = getUpdateCenterBaseline();
+        if (resolved == null) {
+            resolved = getVersionBaseline();
+            if (resolved == null) {
+                resolved = getArtifactBaseline();
+                if (resolved == null) {
+                    throw failure("Unable to resolve baseline");
+                }
+            }
+        }
+        return resolved.getAllFiles();
+    }
+
+    private String getBaselinePayload(String prefix) {
+        if (baseline.startsWith(prefix)) {
+            return baseline.substring(prefix.length());
+        }
+        return null;
+    }
+
+    /**
+     * Creates a JAR artifact from Maven Coordinates.
+     *
+     * @return The created artifact. Must be resolved.
+     */
+    private Artifact createArtifact(String groupId, String artifactId, String version) {
+        return new DefaultArtifact(groupId, artifactId, VersionRange.createFromVersion(version), Artifact.SCOPE_COMPILE, "jar", null, new DefaultArtifactHandler("jar"));
+    }
+
+    /**
+     * Parses a JAR artifact from Maven Coordinates.
+     *
+     * @param coordinates Coordinates to parse.
+     * @return The parsed artifact. Must be resolved.
+     */
+    private Artifact parseArtifact(String coordinates) throws MojoFailureException {
+        final List<String> coords = Lists.newArrayList(Splitter.on(':').split(coordinates));
+        if (coords.size() != 3) {
+            throw failure("Invalid coordinates [%s]", coordinates);
+        }
+        return createArtifact(coords.get(0), coords.get(1), coords.get(2));
+    }
+
+    private ResolvedArtifact getUpdateCenterBaseline() throws MojoFailureException {
+        final String url = getBaselinePayload(UPDATE_CENTER);
+        if (url == null || url.isEmpty()) {
+            return null;
+        }
         final JsonElement updates;
         try {
             // TODO: look for internal Maven URL downloading methods (using proxies, etc.)
             final OkHttpClient client = new OkHttpClient();
-            Request request = new Request.Builder().url(UPDATE_CENTER).build();
+            Request request = new Request.Builder().url(url).build();
             String response = client.newCall(request).execute().body().string();
-            // TODO
+            // TODO: review JSONP parsing
             response = response.substring(response.indexOf('{'));
             response = response.substring(0, response.lastIndexOf(')'));
             updates = new JsonParser().parse(new JsonReader(new StringReader(response)));
         } catch (Exception e) {
-            throw new MojoFailureException("Unable to get plugin information from update center", e);
+            throw failure(e, "Unable to get plugin information from update center [%s]", url);
         }
-        final String groupId, artifactId, version;
+        // TODO: error reporting, new plugins, etc.
+        final String coordinates;
         try {
-            // TODO: error reporting, new plugins, etc.
-            final String coordinates = updates.getAsJsonObject().get("plugins").getAsJsonObject().get(mavenProject.getArtifactId()).getAsJsonObject().get("gav").getAsString();
-            infof("Comparing against [%s]", coordinates);
-            List<String> coords = Lists.newArrayList(Splitter.on(':').split(coordinates));
-            groupId = coords.get(0);
-            artifactId = coords.get(1);
-            version = coords.get(2);
-        } catch (Exception e) {
-            throw new MojoFailureException("Unable to get plugin coordinates from update center info", e);
+            coordinates = updates.getAsJsonObject().get("plugins").getAsJsonObject().get(mavenProject.getArtifactId()).getAsJsonObject().get("gav").getAsString();
+        } catch (RuntimeException e) {
+            throw failure(e, "Unable to get plugin coordinates from update center [%s] info", url);
         }
-        final DefaultArtifact artifact = new DefaultArtifact(groupId, artifactId, VersionRange.createFromVersion(version), Artifact.SCOPE_COMPILE, "jar", null, new DefaultArtifactHandler("jar"));
-        try {
-            artifactResolver.resolve(artifact, artifactRepositories, localRepository);
-            return artifact.getFile();
-        } catch (ArtifactNotFoundException e) {
-            throw new MojoFailureException("Unable to resolve old version", e);
-        } catch (ArtifactResolutionException e) {
-            throw new MojoFailureException("Unable to resolve old version", e);
-        }
+        return new ResolvedArtifact(parseArtifact(coordinates));
     }
 
-    private Options createOptions(File oldVersion, File newVersion) {
+    private ResolvedArtifact getVersionBaseline() throws MojoFailureException {
+        final String version = getBaselinePayload(VERSION);
+        if (version == null || version.isEmpty()) {
+            return null;
+        }
+        return new ResolvedArtifact(createArtifact(mavenProject.getGroupId(), mavenProject.getArtifactId(), version));
+    }
+
+    private ResolvedArtifact getArtifactBaseline() throws MojoFailureException {
+        final String artifact = getBaselinePayload(ARTIFACT);
+        if (artifact == null || artifact.isEmpty()) {
+            return null;
+        }
+        return new ResolvedArtifact(parseArtifact(artifact));
+    }
+
+    private Options createOptions(Iterable<File> oldVersion, Iterable<File> newVersion) throws MojoFailureException {
+        final boolean oldOk = checkFiles(oldVersion, "old");
+        final boolean newOk = checkFiles(newVersion, "new");
+        if (!oldOk || !newOk) {
+            throw failure("There are unreadable files to compare");
+        }
         final Options options = new Options();
-        options.getOldArchives().add(oldVersion);
-        options.getNewArchives().add(newVersion);
-        //options.setXmlOutputFile(Optional.fromNullable(pathToXmlOutputFile));
-        //options.setHtmlOutputFile(Optional.fromNullable(pathToHtmlOutputFile));
+        Iterables.addAll(options.getOldArchives(), oldVersion);
+        Iterables.addAll(options.getNewArchives(), newVersion);
         options.setOutputOnlyModifications(true);
         options.setAccessModifier(AccessModifier.PROTECTED);
-        //options.addIncludeFromArgument(Optional.fromNullable(includes));
-        //options.addExcludeFromArgument(Optional.fromNullable(excludes));
         options.setOutputOnlyBinaryIncompatibleModifications(true);
         options.setIncludeSynthetic(true);
         options.setIgnoreMissingClasses(true);
         options.setClassPathMode(TWO_SEPARATE_CLASSPATHS);
-        //options.setHtmlStylesheet(Optional.fromNullable(pathToHtmlStylesheet));
-        //options.setOldClassPath(Optional.fromNullable(oldClassPath));
-        //options.setNewClassPath(Optional.fromNullable(newClassPath));
+        infof("Comparing %s with baseline %s for binary compatibility enforcement", options.getNewArchives(), options.getOldArchives());
         return options;
     }
 
-    private List<JApiClass> filter(List<JApiClass> classes) {
-        final List<JApiClass> list = null;
-        return null;
+    private boolean checkFiles(Iterable<File> files, String collectionName) {
+        final List<File> badFiles = Lists.newLinkedList(Iterables.filter(files, new Predicate<File>() {
+            @Override
+            public boolean apply(@Nullable File file) {
+                return file == null || !file.exists() || !file.canRead();
+            }
+        }));
+        if (!badFiles.isEmpty()) {
+            errorf("Unreadable %s version files: %s", collectionName, badFiles);
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Object representing a resolved artifact and (optionally) its transitively resolved artifacts.
+     *
+     * @author Andres Rodriguez
+     */
+    final class ResolvedArtifact {
+        /**
+         * Root artifact.
+         */
+        private final Artifact root;
+        /**
+         * All artifacts.
+         */
+        private final Set<Artifact> all;
+
+        /**
+         * Constructor.
+         */
+        ResolvedArtifact(Artifact artifact) throws MojoFailureException {
+            final boolean transitively = false; // TODO: calculate
+            final ArtifactResolutionRequest request = new ArtifactResolutionRequest();
+            request.setArtifact(artifact);
+            request.setLocalRepository(localRepository);
+            request.setRemoteRepositories(artifactRepositories);
+            request.setResolutionFilter(new ArtifactFilter() {
+                @Override
+                public boolean include(Artifact artifact) {
+                    boolean include = true;
+                    if (artifact != null && artifact.isOptional()) {
+                        include = false;
+                    }
+                    return include;
+                }
+            });
+            if (transitively) {
+                request.setResolveTransitively(true);
+            }
+            final ArtifactResolutionResult resolutionResult = artifactResolver.resolve(request);
+            if (resolutionResult.hasExceptions()) {
+                List<Exception> exceptions = resolutionResult.getExceptions();
+                throw failure(exceptions.get(0), "Could not resolve artifact [%s]", artifact);
+            }
+            Set<Artifact> artifacts = resolutionResult.getArtifacts();
+            if (artifacts.isEmpty()) {
+                throw failure("Could not resolve artifact [%s]", artifact);
+            }
+            this.root = resolutionResult.getOriginatingArtifact();
+            this.all = ImmutableSet.copyOf(artifacts);
+        }
+
+        Artifact getRoot() {
+            return root;
+        }
+
+        Iterable<Artifact> getAll() {
+            return all;
+        }
+
+        Iterable<Artifact> getOthers() {
+            return Iterables.filter(all, Predicates.not(Predicates.equalTo(root)));
+        }
+
+        Iterable<File> getAllFiles() {
+            return Iterables.transform(all, new Function<Artifact, File>() {
+                @Override
+                public File apply(@Nullable Artifact artifact) {
+                    return artifact.getFile();
+                }
+            });
+        }
     }
 
 
