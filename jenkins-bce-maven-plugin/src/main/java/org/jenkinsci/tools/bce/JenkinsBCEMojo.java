@@ -23,12 +23,9 @@
  */
 package org.jenkinsci.tools.bce;
 
-import com.google.common.base.Function;
 import com.google.common.base.Predicate;
-import com.google.common.base.Predicates;
 import com.google.common.base.Splitter;
 import com.google.common.collect.ImmutableList;
-import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
 import com.google.gson.JsonElement;
@@ -41,7 +38,6 @@ import japicmp.cmp.JarArchiveComparatorOptions;
 import japicmp.config.Options;
 import japicmp.model.AccessModifier;
 import japicmp.model.JApiClass;
-import japicmp.output.stdout.StdoutOutputGenerator;
 import org.apache.maven.artifact.Artifact;
 import org.apache.maven.artifact.DefaultArtifact;
 import org.apache.maven.artifact.handler.DefaultArtifactHandler;
@@ -49,7 +45,6 @@ import org.apache.maven.artifact.repository.ArtifactRepository;
 import org.apache.maven.artifact.resolver.ArtifactResolutionRequest;
 import org.apache.maven.artifact.resolver.ArtifactResolutionResult;
 import org.apache.maven.artifact.resolver.ArtifactResolver;
-import org.apache.maven.artifact.resolver.filter.ArtifactFilter;
 import org.apache.maven.artifact.versioning.VersionRange;
 import org.apache.maven.plugin.AbstractMojo;
 import org.apache.maven.plugin.MojoExecutionException;
@@ -123,6 +118,21 @@ public class JenkinsBCEMojo extends AbstractMojo {
      */
     @Parameter(defaultValue = "update:https://updates.jenkins-ci.org/update-center.json")
     private String baseline;
+    /**
+     * Dependency inclusion specification. It can be:
+     * <ul>
+     * <li>{@code none}: don't include dependencies.</li>
+     * <li>{@code all}: include all dependencies.</li>
+     * <li>{@code include:<i>pcoord</i>,<i>pcoord</i>,...}: include only the specified dependencies.</li>
+     * <li>{@code exclude:<i>pcoord</i>,<i>pcoord</i>,...}: include all but the specified dependencies.</li>
+     * <li>{@code artifact:<i>groupId</i>:<i>artifact</i>:<i>version</i>}: use the specified jar artifact.
+     * </ul>
+     * In the last two cases, {@code <i>pcoord</i>} can be {@code artifact:<i>groupId</i>:<i>artifact</i>}
+     * to match every version of the specified artifact or {@code artifact:<i>groupId</i>} to match every
+     * artifact from the specified group.
+     */
+    @Parameter(defaultValue = "none")
+    private String dependencySpec;
 
     private void error(CharSequence s) {
         getLog().error(s);
@@ -149,15 +159,11 @@ public class JenkinsBCEMojo extends AbstractMojo {
     }
 
     private MojoFailureException failure(Throwable cause, String format, Object... args) {
-        String error = String.format(format, args);
-        error(error);
-        return new MojoFailureException(error, cause);
+        return new MojoFailureException(String.format(format, args), cause);
     }
 
     private MojoFailureException failure(String format, Object... args) {
-        String error = String.format(format, args);
-        error(error);
-        return new MojoFailureException(error);
+        return new MojoFailureException(String.format(format, args));
     }
 
     public void execute() throws MojoExecutionException, MojoFailureException {
@@ -172,29 +178,35 @@ public class JenkinsBCEMojo extends AbstractMojo {
             warn("Not a Jenkins plugin. Skipping");
             return;
         }
-
-        // Get the new package file.
-        final List<File> newVersion = ImmutableList.of(new File(projectBuildDir, mavenProject.getArtifactId() + ".jar"));
-        // Get the old package file
-        final Iterable<File> oldVersion = getOldVersionFiles();
-        final Options options = createOptions(oldVersion, newVersion);
-        JarArchiveComparator jarArchiveComparator = new JarArchiveComparator(JarArchiveComparatorOptions.of(options));
-        List<JApiClass> jApiClasses = jarArchiveComparator.compare(options.getOldArchives(), options.getNewArchives());
-        // Filter the list
-        final BinaryChanges changes = BinaryChanges.of(jApiClasses);
-        if (!changes.isEmpty()) {
-            // TODO: analyze if custom reporting needed
-            StdoutOutputGenerator stdoutOutputGenerator = new StdoutOutputGenerator(options, Lists.newLinkedList(changes.getChangedClasses()));
-            errorf("Binary Incompatible Changes Detected\n %s", stdoutOutputGenerator.generate());
-            throw new MojoFailureException("Binary Incompatible Changes Detected");
-        } else {
-            if (changes.isIgnored()) {
-                warn("You have ignored binary compatibility issues. Please think again");
+        try {
+            // Get the new package file.
+            // final List<File> newVersion = ImmutableList.of(new File(projectBuildDir, mavenProject.getArtifactId() + ".jar"));
+            final Iterable<File> newVersion = getNewVersionFiles();
+            // Get the old package file
+            final Iterable<File> oldVersion = getOldVersionFiles();
+            final Options options = createOptions(oldVersion, newVersion);
+            JarArchiveComparator jarArchiveComparator = new JarArchiveComparator(JarArchiveComparatorOptions.of(options));
+            List<JApiClass> jApiClasses = jarArchiveComparator.compare(options.getOldArchives(), options.getNewArchives());
+            // Filter the list
+            final BinaryChanges changes = BinaryChanges.of(jApiClasses);
+            if (!changes.isEmpty()) {
+                // TODO: analyze if custom reporting needed
+                // StdoutOutputGenerator stdoutOutputGenerator = new StdoutOutputGenerator(options, Lists.newLinkedList(changes.getChangedClasses()));
+                // errorf("Binary Incompatible Changes Detected\n %s", stdoutOutputGenerator.generate());
+                throw new MojoFailureException("Binary Incompatible Changes Detected");
+            } else {
+                if (changes.isIgnored()) {
+                    warn("You have ignored binary compatibility issues. Please think again");
+                }
+                if (changes.isAccepted()) {
+                    warn("You have accepted binary compatibility issues. Remember to document them in the release notes");
+                }
             }
-            if (changes.isAccepted()) {
-                warn("You have accepted binary compatibility issues. Remember to document them in the release notes");
-            }
+        } catch(MojoFailureException e) {
+            error(e.getMessage());
+            throw e;
         }
+
     }
 
     /**
@@ -202,6 +214,10 @@ public class JenkinsBCEMojo extends AbstractMojo {
      */
     private boolean skip() {
         return mavenProject == null || baseline == null || baseline.startsWith(SKIP);
+    }
+
+    private Iterable<File> getNewVersionFiles() throws MojoFailureException {
+        return new ResolvedArtifact(createArtifact(mavenProject.getGroupId(), mavenProject.getArtifactId(), mavenProject.getVersion())).getFiles();
     }
 
     private Iterable<File> getOldVersionFiles() throws MojoFailureException {
@@ -215,7 +231,7 @@ public class JenkinsBCEMojo extends AbstractMojo {
                 }
             }
         }
-        return resolved.getAllFiles();
+        return resolved.getFiles();
     }
 
     private String getBaselinePayload(String prefix) {
@@ -332,36 +348,25 @@ public class JenkinsBCEMojo extends AbstractMojo {
      */
     final class ResolvedArtifact {
         /**
-         * Root artifact.
+         * Resolved Artifact.
          */
-        private final Artifact root;
+        private final Artifact artifact;
         /**
-         * All artifacts.
+         * Resolved files.
          */
-        private final Set<Artifact> all;
+        private final List<File> files;
 
         /**
          * Constructor.
          */
         ResolvedArtifact(Artifact artifact) throws MojoFailureException {
-            final boolean transitively = false; // TODO: calculate
+            final DependencyPolicy dependencyPolicy = DependencyPolicy.of(dependencySpec);
             final ArtifactResolutionRequest request = new ArtifactResolutionRequest();
             request.setArtifact(artifact);
             request.setLocalRepository(localRepository);
             request.setRemoteRepositories(artifactRepositories);
-            request.setResolutionFilter(new ArtifactFilter() {
-                @Override
-                public boolean include(Artifact artifact) {
-                    boolean include = true;
-                    if (artifact != null && artifact.isOptional()) {
-                        include = false;
-                    }
-                    return include;
-                }
-            });
-            if (transitively) {
-                request.setResolveTransitively(true);
-            }
+            request.setResolutionFilter(dependencyPolicy);
+            request.setResolveTransitively(dependencyPolicy.isTransitive());
             final ArtifactResolutionResult resolutionResult = artifactResolver.resolve(request);
             if (resolutionResult.hasExceptions()) {
                 List<Exception> exceptions = resolutionResult.getExceptions();
@@ -371,31 +376,22 @@ public class JenkinsBCEMojo extends AbstractMojo {
             if (artifacts.isEmpty()) {
                 throw failure("Could not resolve artifact [%s]", artifact);
             }
-            this.root = resolutionResult.getOriginatingArtifact();
-            this.all = ImmutableSet.copyOf(artifacts);
-        }
-
-        Artifact getRoot() {
-            return root;
-        }
-
-        Iterable<Artifact> getAll() {
-            return all;
-        }
-
-        Iterable<Artifact> getOthers() {
-            return Iterables.filter(all, Predicates.not(Predicates.equalTo(root)));
-        }
-
-        Iterable<File> getAllFiles() {
-            return Iterables.transform(all, new Function<Artifact, File>() {
-                @Override
-                public File apply(@Nullable Artifact artifact) {
-                    return artifact.getFile();
+            this.artifact = resolutionResult.getOriginatingArtifact();
+            final ImmutableList.Builder<File> b = ImmutableList.builder();
+            for (Artifact a : artifacts) {
+                if (a.isResolved() && a.getFile() != null) {
+                    b.add(a.getFile());
                 }
-            });
+            }
+            this.files = b.build();
+        }
+
+        Artifact getArtifact() {
+            return artifact;
+        }
+
+        List<File> getFiles() {
+            return files;
         }
     }
-
-
 }
