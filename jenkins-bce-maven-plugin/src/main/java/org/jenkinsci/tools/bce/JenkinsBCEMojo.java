@@ -38,6 +38,7 @@ import japicmp.cmp.JarArchiveComparatorOptions;
 import japicmp.config.Options;
 import japicmp.model.AccessModifier;
 import japicmp.model.JApiClass;
+import japicmp.output.stdout.StdoutOutputGenerator;
 import org.apache.maven.artifact.Artifact;
 import org.apache.maven.artifact.DefaultArtifact;
 import org.apache.maven.artifact.handler.DefaultArtifactHandler;
@@ -191,8 +192,8 @@ public class JenkinsBCEMojo extends AbstractMojo {
             final BinaryChanges changes = BinaryChanges.of(jApiClasses);
             if (!changes.isEmpty()) {
                 // TODO: analyze if custom reporting needed
-                // StdoutOutputGenerator stdoutOutputGenerator = new StdoutOutputGenerator(options, Lists.newLinkedList(changes.getChangedClasses()));
-                // errorf("Binary Incompatible Changes Detected\n %s", stdoutOutputGenerator.generate());
+                StdoutOutputGenerator stdoutOutputGenerator = new StdoutOutputGenerator(options, Lists.newLinkedList(changes.getChangedClasses()));
+                errorf("Binary Incompatible Changes Detected\n %s", stdoutOutputGenerator.generate());
                 throw new MojoFailureException("Binary Incompatible Changes Detected");
             } else {
                 if (changes.isIgnored()) {
